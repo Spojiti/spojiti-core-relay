@@ -2,8 +2,8 @@
 
 **Spojiti Private Messenger Core** is the free text-messaging path of Spojiti:
 the client half
-([spojiti-core-app](https://github.com/Spojiti/spojiti-core-app)) and the relay
-half ([spojiti-core-relay](https://github.com/Spojiti/spojiti-core-relay)),
+([spojiti-core-app](https://github.com/CognitionX-Logic/spojiti-core-app)) and the relay
+half ([spojiti-core-relay](https://github.com/CognitionX-Logic/spojiti-core-relay)),
 under the GNU AGPL v3. This document is the same in both repositories.
 
 The Spojiti product is not open source. This is a deliberate line, and it is
