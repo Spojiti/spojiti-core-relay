@@ -36,7 +36,14 @@ defmodule SpojitiRelayWeb.QueueChannel do
 
   @impl true
   def handle_info(:touch_seen, socket) do
-    Accounts.touch_last_seen(socket.assigns.account_id)
+    # Guarded: a last-seen stamp is a nicety. Under pool pressure the write is
+    # shed by raising, and an unguarded raise here kills the socket over it.
+    try do
+      Accounts.touch_last_seen(socket.assigns.account_id)
+    rescue
+      _ -> :ok
+    end
+
     {:noreply, socket}
   end
 
@@ -67,7 +74,15 @@ defmodule SpojitiRelayWeb.QueueChannel do
 
   @impl true
   def terminate(_reason, socket) do
-    Accounts.touch_last_seen(socket.assigns.account_id)
+    # Guarded for the same reason as :touch_seen — and this is the one that
+    # fires during a cascade: a dying channel must not issue one more query
+    # at the exact moment the pool is starving. Death must not generate load.
+    try do
+      Accounts.touch_last_seen(socket.assigns.account_id)
+    rescue
+      _ -> :ok
+    end
+
     :ok
   end
 
@@ -82,14 +97,30 @@ defmodule SpojitiRelayWeb.QueueChannel do
   end
 
   def handle_in("message:send", %{"to" => _, "ciphertext" => _} = payload, socket) do
-    case Delivery.deliver_one(payload, socket.assigns.account_id) do
-      {:ok, stored} -> {:reply, {:ok, %{id: stored.id, status: "queued"}}, socket}
-      {:error, _} -> {:reply, {:error, %{reason: "invalid_message"}}, socket}
+    # A SHED QUERY MUST NOT COST THE USER THEIR SOCKET. DBConnection sheds by
+    # raising; unguarded, the raise kills the channel and the client reads a
+    # disconnect. Degrade, do not collapse: the send fails with "busy" (the
+    # client treats it as retryable) and the connection lives.
+    try do
+      case Delivery.deliver_one(payload, socket.assigns.account_id) do
+        {:ok, stored} -> {:reply, {:ok, %{id: stored.id, status: "queued"}}, socket}
+        {:error, _} -> {:reply, {:error, %{reason: "invalid_message"}}, socket}
+      end
+    rescue
+      _ in DBConnection.ConnectionError ->
+        {:reply, {:error, %{reason: "busy"}}, socket}
     end
   end
 
   def handle_in("message:ack", %{"id" => id}, socket) do
-    Messaging.ack(id, socket.assigns.account_id)
+    # Guarded like message:send. An ack that cannot reach the pool is retried
+    # by the client on its next flush — the envelope is still stored.
+    try do
+      Messaging.ack(id, socket.assigns.account_id)
+    rescue
+      _ in DBConnection.ConnectionError -> :ok
+    end
+
     {:reply, :ok, socket}
   end
 
