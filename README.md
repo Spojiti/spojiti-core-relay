@@ -78,4 +78,4 @@ architecture: one device per account, one retention window, text.
   `test/spojiti_relay_web/channels/queue_channel_test.exs`.
 * Logs redact who talks to whom: `config/config.exs` (`filter_parameters`).
 
-Security reports: https://spojiti.world/.well-known/security.txt
+White Paper: https://beta.spojiti.world/whitepaper.html 
