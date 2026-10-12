@@ -56,6 +56,37 @@ defmodule SpojitiRelay.RateLimiter do
     end
   end
 
+  @doc """
+  B378 · a small value kept beside the counters, in the same table and swept
+  by the same rule: `{bucket, id}` for the CURRENT `window_ms` window. Used by
+  /api/turn to remember WHEN an account was last charged against its daily
+  budget (never a credential). Fail-open like `check/5`.
+  """
+  def put_memo(bucket, id, window_ms, value) do
+    now = System.system_time(:millisecond)
+
+    try do
+      :ets.insert(@table, {{bucket, id, window_ms, div(now, window_ms)}, value})
+      :ok
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  @doc "B378 · the value `put_memo/4` left for `{bucket, id}` this window, or nil."
+  def get_memo(bucket, id, window_ms) do
+    now = System.system_time(:millisecond)
+
+    try do
+      case :ets.lookup(@table, {bucket, id, window_ms, div(now, window_ms)}) do
+        [{_, value}] -> value
+        _ -> nil
+      end
+    rescue
+      ArgumentError -> nil
+    end
+  end
+
   # --- GenServer: owns the table + periodic sweep -----------------------------
 
   @impl true

@@ -91,24 +91,25 @@ defmodule SpojitiRelayWeb.QueueChannel do
     if length(items) > Delivery.batch_cap() do
       {:reply, {:error, %{reason: "batch_too_large", cap: Delivery.batch_cap()}}, socket}
     else
-      {ok, bad} = Delivery.deliver_batch(items, socket.assigns.account_id)
-      {:reply, {:ok, %{n: ok, failed: bad}}, socket}
+      # A shed part-way is "busy" with the counts so far; the socket lives
+      # and the sender retries the frame.
+      case Delivery.deliver_batch(items, socket.assigns.account_id) do
+        {:busy, ok, bad} -> {:reply, {:error, %{reason: "busy", n: ok, failed: bad}}, socket}
+        {ok, bad} -> {:reply, {:ok, %{n: ok, failed: bad}}, socket}
+      end
     end
   end
 
   def handle_in("message:send", %{"to" => _, "ciphertext" => _} = payload, socket) do
     # A SHED QUERY MUST NOT COST THE USER THEIR SOCKET. DBConnection sheds by
     # raising; unguarded, the raise kills the channel and the client reads a
-    # disconnect. Degrade, do not collapse: the send fails with "busy" (the
-    # client treats it as retryable) and the connection lives.
-    try do
-      case Delivery.deliver_one(payload, socket.assigns.account_id) do
-        {:ok, stored} -> {:reply, {:ok, %{id: stored.id, status: "queued"}}, socket}
-        {:error, _} -> {:reply, {:error, %{reason: "invalid_message"}}, socket}
-      end
-    rescue
-      _ in DBConnection.ConnectionError ->
-        {:reply, {:error, %{reason: "busy"}}, socket}
+    # disconnect. Degrade, do not collapse: Delivery guards the path and the
+    # send fails with "busy" (the client treats it as retryable) while the
+    # connection lives -- on every send event of both lanes, not this one.
+    case Delivery.deliver_one(payload, socket.assigns.account_id) do
+      {:ok, stored} -> {:reply, {:ok, %{id: stored.id, status: "queued"}}, socket}
+      {:error, :busy} -> {:reply, {:error, %{reason: "busy"}}, socket}
+      {:error, _} -> {:reply, {:error, %{reason: "invalid_message"}}, socket}
     end
   end
 

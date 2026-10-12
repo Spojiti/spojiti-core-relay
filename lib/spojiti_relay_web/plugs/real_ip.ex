@@ -24,6 +24,21 @@ defmodule SpojitiRelayWeb.Plugs.RealIp do
   when the immediate peer is inside the container network or loopback — the
   places only our own proxies can be — and is otherwise ignored entirely.
 
+  2026-10-06 (CEO item 5) · THE WEBSITE BOX IS A PROXY TOO. Website traffic
+  takes one more hop than the app's: browser → the web box's Caddy → the
+  relay's Caddy (which trusts exactly that box, TRUSTED_WEB_PROXY, and
+  APPENDS it) → here. X-Forwarded-For arrives as "client, webbox". The walk
+  below took the rightmost entry that was not internal — the web box, a
+  public address — so every visitor to beta.spojiti.world shared ONE bucket:
+  a single script could lock the whole website out of tickets, codes and
+  sign-ins, and every per-address limit on it meant nothing. The relay now
+  reads the same TRUSTED_WEB_PROXY (a cell line from tools/cell-render.py,
+  passed to the relay and ctl services by compose) and walks past those
+  addresses too, taking the rightmost entry that is NOT one of our proxies.
+  Only the immediate peer decides whether the header is read at all; a web
+  box address merely appearing in a client-sent header buys nothing, because
+  the web box's Caddy replaces X-Forwarded-For with the connecting address.
+
   WHAT IS AND IS NOT STORED. Nothing. This plug computes an address, puts it
   in `conn.assigns` for the limiter to hash into a bucket key, and stops. No
   IP is written to the database, none reaches a log line we emit, and the
@@ -101,11 +116,82 @@ defmodule SpojitiRelayWeb.Plugs.RealIp do
     |> Enum.reverse()
     |> Enum.find_value(fn candidate ->
       case parse(candidate) do
-        {:ok, ip} -> if trusted_peer?(ip), do: nil, else: ip
+        {:ok, ip} -> if trusted_peer?(ip) or web_proxy?(ip), do: nil, else: ip
         :error -> nil
       end
     end)
   end
+
+  @doc """
+  Is `ip` one of the rail's website boxes (TRUSTED_WEB_PROXY: CIDRs separated
+  by spaces or commas — the exact value Caddy's `trusted_proxies static`
+  reads)? Unset or unparseable entries trust nothing extra.
+  """
+  def web_proxy?(ip) when is_tuple(ip) do
+    Enum.any?(web_proxies(), fn net -> in_cidr?(ip, net) end)
+  end
+
+  def web_proxy?(_), do: false
+
+  # Parsed once per distinct value: the env is read per request (cheap), the
+  # parse is redone only when the value changes (once per boot in practice).
+  defp web_proxies do
+    raw = System.get_env("TRUSTED_WEB_PROXY") || ""
+
+    case :persistent_term.get({__MODULE__, :web}, nil) do
+      {^raw, nets} ->
+        nets
+
+      _ ->
+        nets =
+          raw
+          |> String.split([" ", ",", "\t", "\n"], trim: true)
+          |> Enum.flat_map(fn cidr ->
+            case cidr(cidr) do
+              {:ok, net} -> [net]
+              :error -> []
+            end
+          end)
+
+        :persistent_term.put({__MODULE__, :web}, {raw, nets})
+        nets
+    end
+  end
+
+  defp cidr(s) do
+    {addr, len} =
+      case String.split(s, "/", parts: 2) do
+        [a, l] -> {a, Integer.parse(l)}
+        [a] -> {a, nil}
+      end
+
+    with {:ok, ip} <- :inet.parse_address(String.to_charlist(addr)) do
+      bits = tuple_size(ip) * if(tuple_size(ip) == 4, do: 8, else: 16)
+
+      case len do
+        nil -> {:ok, {ip, bits}}
+        {n, ""} when n >= 0 and n <= bits -> {:ok, {ip, n}}
+        _ -> :error
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  defp in_cidr?(ip, {net, len}) when tuple_size(ip) == tuple_size(net) do
+    size = if tuple_size(ip) == 4, do: 8, else: 16
+    <<a::bitstring-size(^len), _::bitstring>> = to_bits(ip, size)
+    <<b::bitstring-size(^len), _::bitstring>> = to_bits(net, size)
+    a == b
+  end
+
+  # An IPv4 client may arrive as ::ffff:a.b.c.d on a dual-stack listener.
+  defp in_cidr?({0, 0, 0, 0, 0, 0xFFFF, x, y}, {net, _} = n) when tuple_size(net) == 4,
+    do: in_cidr?({div(x, 256), rem(x, 256), div(y, 256), rem(y, 256)}, n)
+
+  defp in_cidr?(_, _), do: false
+
+  defp to_bits(ip, size), do: for(p <- Tuple.to_list(ip), into: <<>>, do: <<p::size(size)>>)
 
   # Strip an optional :port on IPv4 and the brackets IPv6 arrives in.
   defp parse(""), do: :error

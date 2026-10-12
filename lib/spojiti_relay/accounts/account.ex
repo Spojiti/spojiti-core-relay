@@ -23,6 +23,12 @@ defmodule SpojitiRelay.Accounts.Account do
     field :registration_id, :integer
     # Stamped when the account's last socket disconnects (for "last seen").
     field :last_seen_at, :utc_datetime
+    # 2026-10-06 · C5 · a load-test account (load-rail.py, the cross-cell
+    # proof). Set by Accounts.register/2's `synthetic: true` option, which
+    # RegistrationController passes only for a request carrying this cell's
+    # LOADTEST_KEY. DELIBERATELY NOT IN cast/3 BELOW: a request body that
+    # says "synthetic" must never be able to hide an account from the counts.
+    field :synthetic, :boolean, default: false
 
     has_one :signed_prekey, SpojitiRelay.Keys.SignedPrekey
     # #60 · PQXDH. Absent for every account registered before post-quantum —

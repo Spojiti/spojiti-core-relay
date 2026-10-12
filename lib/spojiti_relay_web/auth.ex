@@ -13,7 +13,7 @@ defmodule SpojitiRelayWeb.Auth do
 
   def call(conn, _opts) do
     with ["Bearer " <> token] <- get_req_header(conn, "authorization"),
-         {:ok, account_id} <- verify(token) do
+         {:ok, account_id} <- verify_any(token) do
       assign(conn, :account_id, account_id)
     else
       _ ->
@@ -21,6 +21,15 @@ defmodule SpojitiRelayWeb.Auth do
         |> put_status(:unauthorized)
         |> Phoenix.Controller.json(%{error: "unauthorized"})
         |> halt()
+    end
+  end
+
+  # B386 · this box's own secret first; on the directory (ctl), a token a
+  # CELL minted is verified by that cell (SpojitiRelay.CellAuth).
+  defp verify_any(token) do
+    case verify(token) do
+      {:ok, _} = ok -> ok
+      _ -> SpojitiRelay.CellAuth.verify_remote(token)
     end
   end
 

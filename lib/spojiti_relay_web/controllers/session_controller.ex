@@ -33,9 +33,17 @@ defmodule SpojitiRelayWeb.SessionController do
         |> json(%{error: "no_signing_key"})
 
       nil ->
-        conn
-        |> put_status(:not_found)
-        |> json(%{error: "not_registered"})
+        # #476 · an identity that registered here and moved cells is sent on,
+        # never told "not registered" (which makes an app register anew)
+        case SpojitiRelay.AccountMove.Cell.moved_identity(identity_key) do
+          {:ok, %{endpoint: e}} ->
+            conn |> put_status(421) |> json(%{error: "account_moved", endpoint: e})
+
+          :none ->
+            conn
+            |> put_status(:not_found)
+            |> json(%{error: "not_registered"})
+        end
     end
   end
 

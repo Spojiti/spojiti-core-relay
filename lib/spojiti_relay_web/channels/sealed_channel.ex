@@ -63,8 +63,11 @@ defmodule SpojitiRelayWeb.SealedChannel do
       when is_binary(to) and is_binary(ct) do
     with :ok <- sealed?(ct),
          :ok <- within_limits(socket, to, 1) do
+      # "busy" is a shed pool (Delivery guards the path): the send failed,
+      # this socket lives, the client retries.
       case Delivery.deliver_one(payload, nil) do
         {:ok, stored} -> {:reply, {:ok, %{id: stored.id, status: "queued"}}, socket}
+        {:error, :busy} -> {:reply, {:error, %{reason: "busy"}}, socket}
         {:error, _} -> {:reply, {:error, %{reason: "invalid_message"}}, socket}
       end
     else
@@ -90,8 +93,10 @@ defmodule SpojitiRelayWeb.SealedChannel do
         # per-recipient budget per distinct recipient in it.
         with :ok <- conn_limit(socket, length(items)),
              :ok <- recipients_limit(items) do
-          {ok, bad} = Delivery.deliver_batch(items, nil)
-          {:reply, {:ok, %{n: ok, failed: bad}}, socket}
+          case Delivery.deliver_batch(items, nil) do
+            {:busy, ok, bad} -> {:reply, {:error, %{reason: "busy", n: ok, failed: bad}}, socket}
+            {ok, bad} -> {:reply, {:ok, %{n: ok, failed: bad}}, socket}
+          end
         else
           {:deny, retry} ->
             {:reply, {:error, %{reason: "rate_limited", retry_after: retry}}, socket}

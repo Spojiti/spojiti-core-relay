@@ -1,47 +1,64 @@
 defmodule SpojitiRelay.Retention do
   @moduledoc """
-  #154 + TIERED RELAY RETENTION — how long an undelivered envelope waits.
+  #154 + RELAY RETENTION — how long an undelivered envelope waits.
 
-  THE PRODUCT RULE (CEO, 2026-08-28): a message the recipient has not collected
-  is held for a published window and then swept. Free 24h, Pro 48h, Pro+ 120h.
-  After that it is gone, by design, and the tier pages say so plainly. This is
-  the first thing in the system that ever deleted a parked envelope: until now
-  NOTHING swept inbox_messages, so the queue grew without bound and the disk
-  had an undated appointment with zero bytes free.
+  THE PRODUCT RULE: a message the recipient has not collected is held for a
+  published window and then swept. After that it is gone, by design, and the
+  pages say so plainly. This was the first thing in the system that ever
+  deleted a parked envelope: before it NOTHING swept inbox_messages, so the
+  queue grew without bound.
 
-  WHOSE TIER GOVERNS — AND WHY THE CRYPTO DECIDED IT. The SENDER's. Only the
-  sender is present at enqueue, and only the sender can present a blind-signed
-  entitlement token; the socket already carries the verified tier from join
-  (queue_channel: Entitlement.tier_of/1). Recipient-governed retention would
-  need the relay to hold a per-account tier — a standing commercial fact about
-  a named account, which is exactly the knowledge this relay is built not to
-  have. So the privacy-correct answer and the architecturally natural one are
-  the same, and it reads well besides: your messages are held for up to N hours
-  while your contact is offline. A Free user hearing from a Pro+ friend gets
-  the benefit, which helps us rather than costs us.
+  ONE WINDOW FOR EVERYONE (B383 · #452 D-05 · CEO 2026-10-09, option A).
+  From 2026-08-28 the SENDER's tier chose the window (Free 24h, Premium
+  120h), read from the entitlement token on the frame. On the sealed lane
+  that token was the one thing that tied an anonymous envelope back to an
+  account: the app presented the SAME token on its authenticated join, so the
+  relay could match a sealed send to the account that joined with it. The
+  sealed lane now carries no token at all, so the relay cannot know the
+  sender's plan there, and a window it cannot know cannot differ by plan.
+  Every envelope, on every lane, waits for the same window: the LONGER of
+  the two Ops columns ("Undelivered messages held"), 120 hours by default.
+  Nobody who paid for five days lost them; Free gained them.
 
-  ZERO-KNOWLEDGE HOLDS. The token's bucket is (tier, expiry-month), encoded by
-  WHICH RSA key verifies it and never by payload bytes (EntBlind). The relay
-  learns "this send is entitled to the Pro+ window" and cannot learn which
-  account holds Pro+. Nothing tier-shaped is stored on the row: only a
-  timestamp, which is exactly as revealing as inserted_at already was.
-
-  TRIAL RIDES THE TOP WINDOW deliberately — a trial should show the best of the
-  product, not a middle of it. One line to change if the CEO rules otherwise.
+  `hours_for/1` keeps its argument so the delivery path (which still carries
+  the authenticated lane's tier for its other caps) compiles unchanged; the
+  tier no longer moves the answer. Recipient-governed retention stays out
+  for the reason it always was: it would need the relay to hold a per-account
+  tier, which is exactly the knowledge this relay is built not to have.
   """
 
-  # The single source of truth. Anything that prints these hours to a user —
-  # tier pages, corpus, in-app copy — must read them from here or be checked
-  # against here, or we are back to a claim that outlived its mechanism.
-  @hours %{"free" => 24, "trial" => 120, "pro" => 48, "proplus" => 120}
-  @default_hours 24
+  # The default, when Ops has set nothing. Anything that prints these hours to
+  # a user — tier pages, corpus, in-app copy — must read them from here or be
+  # checked against here (spojiti/test/retention_test.dart), or we are back to
+  # a claim that outlived its mechanism. The tier keys stay so a token in the
+  # field (a retired "pro", a "trial") still resolves; every one answers the
+  # same window since B383.
+  @hours %{"free" => 120, "trial" => 120, "pro" => 120, "proplus" => 120, "premium" => 120}
+  @default_hours 120
 
-  @doc "Retention window in hours for a resolved tier. Unknown ⇒ free."
-  def hours_for(tier) when is_binary(tier), do: Map.get(@hours, tier, @default_hours)
-  def hours_for(_), do: @default_hours
+  @doc """
+  The one retention window, in hours: the longer of the Ops console's two
+  "Undelivered messages held" columns (blank = 120). Taking the longer means
+  no console edit can quietly shorten what a paying user was sold.
+  """
+  def window_hours do
+    [col("free"), col("proplus")] |> Enum.max()
+  end
 
-  @doc "The longest window any tier can buy — the safe horizon for blob sweeps."
-  def max_hours, do: @hours |> Map.values() |> Enum.max()
+  defp col(tier) do
+    case SpojitiRelay.TierCaps.get("retentionHours", tier) do
+      n when is_integer(n) and n >= 1 -> n
+      _ -> Map.get(@hours, tier, @default_hours)
+    end
+  end
+
+  @doc "Retention window for an envelope. The tier no longer moves it (B383 · D-05)."
+  def hours_for(_tier), do: window_hours()
+
+  @doc "The longest window an envelope can have — the safe horizon for blob sweeps."
+  def max_hours do
+    Enum.max([Enum.max(Map.values(@hours)), window_hours()])
+  end
 
   @doc "The whole table, for ops display and for content checks."
   def table, do: @hours

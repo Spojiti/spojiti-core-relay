@@ -10,7 +10,20 @@ defmodule SpojitiRelayWeb.KeyController do
         json(conn, bundle)
 
       {:error, :not_found} ->
-        conn |> put_status(:not_found) |> json(%{error: "account_not_found"})
+        # #442 · not on this cell: the home cell answers, one hop. An
+        # account nobody serves is the 404 it always was.
+        case SpojitiRelay.CellForward.route(account_id) do
+          {:remote, endpoint} ->
+            case SpojitiRelay.CellForward.fetch_bundle(endpoint, account_id) do
+              {:ok, bundle} -> json(conn, bundle)
+              {:error, 404} -> conn |> put_status(:not_found) |> json(%{error: "account_not_found"})
+              {:error, 409} -> conn |> put_status(:conflict) |> json(%{error: "no_signed_prekey"})
+              {:error, _} -> conn |> put_status(:service_unavailable) |> json(%{error: "cell_unavailable"})
+            end
+
+          _ ->
+            conn |> put_status(:not_found) |> json(%{error: "account_not_found"})
+        end
 
       {:error, :no_signed_prekey} ->
         conn |> put_status(:conflict) |> json(%{error: "no_signed_prekey"})

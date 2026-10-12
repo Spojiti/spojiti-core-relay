@@ -17,9 +17,14 @@ defmodule SpojitiRelay.Accounts do
         "one_time_prekeys" => [%{"key_id" => int, "public_key" => base64}, ...]
       }
   """
-  def register(attrs) do
+  def register(attrs, opts \\ []) do
+    # C5 · `synthetic: true` only from a caller that has PROVEN a load test
+    # (RegistrationController's LOADTEST_KEY check, or an operator's rpc in
+    # Beta-CrossCell-Proof.sh); the changeset never casts it from attrs.
+    account = %Account{synthetic: Keyword.get(opts, :synthetic, false) == true}
+
     Ecto.Multi.new()
-    |> Ecto.Multi.insert(:account, Account.changeset(%Account{}, attrs))
+    |> Ecto.Multi.insert(:account, Account.changeset(account, attrs))
     |> Ecto.Multi.insert(:signed_prekey, fn %{account: account} ->
       spk = Map.get(attrs, "signed_prekey", %{})
       SignedPrekey.changeset(%SignedPrekey{}, Map.put(spk, "account_id", account.id))
@@ -67,6 +72,58 @@ defmodule SpojitiRelay.Accounts do
     Repo.get(Account, account_id)
   rescue
     Ecto.Query.CastError -> nil
+  end
+
+  # 2026-10-06 · THE OFFICIAL ACCOUNT, :Spojiti. Pinned in the app
+  # (spojiti/lib/data/official_account.dart); the relay needs only its id,
+  # to leave it out of every "people" number (C5: accounts, active, beta
+  # seats) and out of the per-message counters, and so that the beta clean
+  # slate (Beta-Clean-Slate.sh) keeps it.
+  @official_id "917ae952-8702-4102-8a5f-5ac88b6245e2"
+
+  @doc "The :Spojiti official account's id."
+  def official_id, do: @official_id
+
+  @doc """
+  2026-10-06 · C1 + C5 · does this account still exist, and is it a load-test
+  account -- ONE indexed lookup by primary key, made once per socket connect
+  and once per GET /api/me, never per message.
+
+    {:ok, synthetic?}  the row is there
+    :gone              the database answered, and there is no such row
+    :unknown           the database did not answer (a shed pool, a restart)
+
+  :gone is only ever said on a real answer. The app wipes its identity and
+  every local chat when it hears account_gone (the beta clean slate), so a
+  pool blip that read as "gone" would destroy a working install: a lookup
+  that cannot prove absence says :unknown, and the callers fail open.
+  """
+  def status(account_id) do
+    case Ecto.UUID.cast(account_id) do
+      {:ok, uuid} ->
+        case from(a in Account, where: a.id == ^uuid, select: a.synthetic) |> Repo.all() do
+          [s] ->
+            {:ok, s == true}
+
+          [] ->
+            # #476 · an account that MOVED to another cell is not gone: the
+            # forwarding address is the answer, never "gone" (which an app
+            # reads as "wipe this identity")
+            case SpojitiRelay.AccountMove.Cell.moved(uuid) do
+              {:ok, %{endpoint: e}} -> {:moved, e}
+              :none -> :gone
+            end
+        end
+
+      # A token is signed by this relay over an account id, so a value that is
+      # not a uuid cannot name an account that exists.
+      :error ->
+        :gone
+    end
+  rescue
+    _ -> :unknown
+  catch
+    :exit, _ -> :unknown
   end
 
   @doc "Look up an account by its base64 X25519 identity key (used for device-restore login)."
@@ -177,4 +234,65 @@ defmodule SpojitiRelay.Accounts do
   end
 
   def put_caps(_account_id, _), do: {:error, :bad_request}
+
+  @doc """
+  2026-09-28 · THE OWNER DELETES THE ACCOUNT, EVERYWHERE ON THIS RELAY.
+
+  Until now nothing could: no route removed an `accounts` row, so an
+  identity the owner had wiped on every device still sat here with its
+  public keys, device records, wake handles and last-seen time, for ever
+  (DATA-INVENTORY.md recorded it as a finding). This removes, in one
+  transaction: the account's wake handles (push_tokens), its encrypted
+  backup slot, every envelope still waiting FOR it, and the account row --
+  whose foreign keys take its prekeys and device records with it; its
+  discovery beacons become tombstones (#442: every cell mirrors them, and
+  a tombstone is how the others learn). Its encrypted media is swept after the commit (object store
+  first, SpojitiRelay.Media.sweep_where/1). Envelopes it SENT to others stay
+  theirs to collect, as they would after any sender goes offline.
+
+  What survives is only what never named it: the daily counts in
+  stats_daily (a deletion is itself counted there, as a number). The
+  passkey recovery blob is keyed so this relay cannot tell whose it is; the
+  app deletes it with its own owner tag.
+
+  `{:ok, :deleted}` or `{:ok, :not_found}` -- idempotent, like every other
+  delete here.
+  """
+  def delete_account(account_id) do
+    with {:ok, uuid} <- Ecto.UUID.cast(account_id) do
+      result =
+        Repo.transaction(fn ->
+          for {table, col} <- [{"push_tokens", :account_id}, {"account_backups", :account_id},
+                               {"inbox_messages", :recipient_account_id}] do
+            from(r in table, where: field(r, ^col) == type(^uuid, :binary_id))
+            |> Repo.delete_all()
+          end
+
+          # #442 · the account's beacons: a tombstone each, not a cascade --
+          # the other cells mirror them and must learn the opt-out (the
+          # foreign key that used to take them went with relay 1.32.0)
+          :ok = SpojitiRelay.Discovery.delete_beacon(uuid)
+
+          # C5 · the row says whether it was a person; a load-test account's
+          # deletion is not one of "accounts deleted by their owners"
+          {n, synth} = from(a in Account, where: a.id == ^uuid, select: a.synthetic) |> Repo.delete_all()
+          {n, synth == [true] or uuid == @official_id}
+        end)
+
+      case result do
+        {:ok, {1, uncounted?}} ->
+          SpojitiRelay.Media.sweep_where(dynamic([b], b.owner_account_id == type(^uuid, :binary_id)))
+          unless uncounted?, do: SpojitiRelay.Stats.bump("deletions")
+          {:ok, :deleted}
+
+        {:ok, {0, _}} ->
+          {:ok, :not_found}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      :error -> {:ok, :not_found}
+    end
+  end
 end
